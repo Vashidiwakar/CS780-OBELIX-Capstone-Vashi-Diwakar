@@ -1,0 +1,228 @@
+"""Offline trainer: Dueling Double DQN — Phase 2 (blinking box + wall).
+
+Curriculum: difficulty=0 for ep_switch episodes, then difficulty=2.
+Improvements:
+  - Successful push transitions stored 6x in replay buffer
+  - Longer exploration (eps_decay_steps=800k, eps_end=0.15)
+  - Longer d0 phase (ep_switch=1200)
+  - gc.collect() every episode to manage memory
+
+Example:
+  python train_d3qn_phase2.py --obelix_py ./obelix.py --out weights_phase2.pth --wall_obstacles
+"""
+
+from __future__ import annotations
+import argparse, random, gc
+from collections import deque
+from dataclasses import dataclass
+from typing import Deque
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+ACTIONS = ["L45", "L22", "FW", "R22", "R45"]
+
+
+class DuelingDQN(nn.Module):
+    def __init__(self, in_dim=18, n_actions=5, hidden=128):
+        super().__init__()
+        self.feature = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+        )
+        self.value = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        self.advantage = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, n_actions),
+        )
+
+    def forward(self, x):
+        feat = self.feature(x)
+        v    = self.value(feat)
+        a    = self.advantage(feat)
+        return v + (a - a.mean(dim=1, keepdim=True))
+
+
+@dataclass
+class Transition:
+    s:    np.ndarray
+    a:    int
+    r:    float
+    s2:   np.ndarray
+    done: bool
+
+
+class Replay:
+    def __init__(self, cap: int = 50_000):
+        self.buf: Deque[Transition] = deque(maxlen=cap)
+
+    def add(self, t: Transition):
+        self.buf.append(t)
+
+    def sample(self, batch: int):
+        idx   = np.random.choice(len(self.buf), size=batch, replace=False)
+        items = [self.buf[i] for i in idx]
+        s  = np.stack([it.s    for it in items]).astype(np.float32)
+        a  = np.array([it.a    for it in items], dtype=np.int64)
+        r  = np.array([it.r    for it in items], dtype=np.float32)
+        s2 = np.stack([it.s2   for it in items]).astype(np.float32)
+        d  = np.array([it.done for it in items], dtype=np.float32)
+        return s, a, r, s2, d
+
+    def __len__(self):
+        return len(self.buf)
+
+
+def import_obelix(path: str):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("obelix_env", path)
+    mod  = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.OBELIX
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--obelix_py",       type=str,   required=True)
+    ap.add_argument("--out",             type=str,   default="weights_phase2.pth")
+    ap.add_argument("--episodes",        type=int,   default=3000)
+    ap.add_argument("--max_steps",       type=int,   default=1000)
+    ap.add_argument("--ep_switch",       type=int,   default=1200)
+    ap.add_argument("--wall_obstacles",  action="store_true")
+    ap.add_argument("--box_speed",       type=int,   default=2)
+    ap.add_argument("--scaling_factor",  type=int,   default=5)
+    ap.add_argument("--arena_size",      type=int,   default=500)
+
+    ap.add_argument("--gamma",           type=float, default=0.99)
+    ap.add_argument("--lr",              type=float, default=5e-4)
+    ap.add_argument("--batch",           type=int,   default=128)
+    ap.add_argument("--replay",          type=int,   default=50_000)
+    ap.add_argument("--warmup",          type=int,   default=2000)
+    ap.add_argument("--target_sync",     type=int,   default=1000)
+    ap.add_argument("--eps_start",       type=float, default=1.0)
+    ap.add_argument("--eps_end",         type=float, default=0.15)
+    ap.add_argument("--eps_decay_steps", type=int,   default=800_000)
+    ap.add_argument("--push_repeat",     type=int,   default=6)   # times to store push transitions
+    ap.add_argument("--hidden",          type=int,   default=128)
+    ap.add_argument("--seed",            type=int,   default=0)
+    args = ap.parse_args()
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    OBELIX = import_obelix(args.obelix_py)
+
+    q   = DuelingDQN(hidden=args.hidden)
+    tgt = DuelingDQN(hidden=args.hidden)
+    tgt.load_state_dict(q.state_dict())
+    tgt.eval()
+
+    opt    = optim.Adam(q.parameters(), lr=args.lr)
+    replay = Replay(args.replay)
+    steps  = 0
+
+    def eps_by_step(t):
+        if t >= args.eps_decay_steps:
+            return args.eps_end
+        frac = t / args.eps_decay_steps
+        return args.eps_start + frac * (args.eps_end - args.eps_start)
+
+    # create both envs once outside loop
+    env_d0 = OBELIX(
+        scaling_factor=args.scaling_factor,
+        arena_size=args.arena_size,
+        max_steps=args.max_steps,
+        wall_obstacles=args.wall_obstacles,
+        difficulty=0,
+        box_speed=args.box_speed,
+        seed=args.seed,
+    )
+    env_d2 = OBELIX(
+        scaling_factor=args.scaling_factor,
+        arena_size=args.arena_size,
+        max_steps=args.max_steps,
+        wall_obstacles=args.wall_obstacles,
+        difficulty=2,
+        box_speed=args.box_speed,
+        seed=args.seed,
+    )
+
+    for ep in range(args.episodes):
+        # curriculum: d0 first, then d2
+        env   = env_d0 if ep < args.ep_switch else env_d2
+        phase = "d0"   if ep < args.ep_switch else "d2"
+
+        s      = env.reset(seed=args.seed + ep)
+        ep_ret = 0.0
+
+        for _ in range(args.max_steps):
+            eps = eps_by_step(steps)
+            if np.random.rand() < eps:
+                a = np.random.randint(len(ACTIONS))
+            else:
+                with torch.no_grad():
+                    qs = q(torch.tensor(s, dtype=torch.float32).unsqueeze(0)).squeeze(0).numpy()
+                a = int(np.argmax(qs))
+
+            s2, r, done = env.step(ACTIONS[a], render=False)
+            ep_ret += float(r)
+
+            t = Transition(s=s, a=a, r=float(r), s2=s2, done=bool(done))
+            replay.add(t)
+
+            # store successful push/delivery transitions multiple times
+            # +100 = attached to box, +2000 = delivered to boundary
+            if r >= 100:
+                for _ in range(args.push_repeat - 1):
+                    replay.add(t)
+
+            s      = np.array(s2, dtype=np.float32)
+            steps += 1
+
+            if len(replay) >= max(args.warmup, args.batch):
+                sb, ab, rb, s2b, db = replay.sample(args.batch)
+                sb_t  = torch.tensor(sb)
+                ab_t  = torch.tensor(ab)
+                rb_t  = torch.tensor(rb)
+                s2b_t = torch.tensor(s2b)
+                db_t  = torch.tensor(db)
+
+                with torch.no_grad():
+                    next_a   = torch.argmax(q(s2b_t), dim=1)
+                    next_val = tgt(s2b_t).gather(1, next_a.unsqueeze(1)).squeeze(1)
+                    y        = rb_t + args.gamma * (1.0 - db_t) * next_val
+
+                pred = q(sb_t).gather(1, ab_t.unsqueeze(1)).squeeze(1)
+                loss = nn.functional.smooth_l1_loss(pred, y)
+
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(q.parameters(), 5.0)
+                opt.step()
+
+                if steps % args.target_sync == 0:
+                    tgt.load_state_dict(q.state_dict())
+
+            if done:
+                break
+
+        if (ep + 1) % 50 == 0:
+            print(f"Episode {ep+1}/{args.episodes} [{phase}] return={ep_ret:.1f} eps={eps_by_step(steps):.3f} replay={len(replay)}")
+            torch.save(q.state_dict(), args.out)
+
+        gc.collect()
+
+    torch.save(q.state_dict(), args.out)
+    print("Saved:", args.out)
+
+
+if __name__ == "__main__":
+    main()
